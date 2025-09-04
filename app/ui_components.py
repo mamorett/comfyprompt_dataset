@@ -8,7 +8,7 @@ from .extractors import cached_extract_prompts
 from .utils import is_image_file, file_hash
 
 def render_image_row(entry: ImageEntry, debug_mode: bool, dataset_dir: Path):
-    col1, col2, col3 = st.columns([1, 3, 1])
+    col1, col2, col3 = st.columns([1.2, 3.2, 0.9])
 
     with col1:
         # Display or load thumbnail on demand
@@ -37,13 +37,14 @@ def render_image_row(entry: ImageEntry, debug_mode: bool, dataset_dir: Path):
         st.markdown(f"**📝 {entry.original_name}**")
         if entry.full_path:
             st.caption(f"Path: {entry.full_path}")
-        new_prompt = st.text_area(
-            "Edit prompt:",
-            value=entry.prompt or "",
-            height=100,
-            key=f"prompt_{entry.id}",
-            label_visibility="collapsed",
-        )
+        with st.expander("Edit prompt", expanded=True):
+            new_prompt = st.text_area(
+                label="Edit prompt",
+                value=entry.prompt or "",
+                height=140,
+                key=f"prompt_{entry.id}",
+                label_visibility="collapsed",
+            )
         if new_prompt != entry.prompt:
             entry.prompt = new_prompt
             entry.modified = True

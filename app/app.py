@@ -1,7 +1,6 @@
 import os
 from pathlib import Path
 import time
-import uuid
 import streamlit as st
 from datetime import datetime
 
@@ -16,12 +15,12 @@ st.set_page_config(page_title="PNG Prompt Extractor & Editor", page_icon="🖼�
 
 def init_session_state():
     ss = st.session_state
-    ss.setdefault("image_data", [])  # List[ImageEntry] stored as dicts
+    ss.setdefault("image_data", [])          # List[ImageEntry] stored as dicts
     ss.setdefault("current_page", 0)
     ss.setdefault("images_per_page", 10)
-    ss.setdefault("processed_files", [])  # list instead of set for serialization stability
+    ss.setdefault("processed_files", [])     # list (not set) for serialization stability
     ss.setdefault("debug_mode", False)
-    ss.setdefault("dataset_dir", "./dataset")
+    ss.setdefault("dataset_dir", "./dataset")  # keep relative by default
     ss.setdefault("auto_rescan_done", False)
 
 def get_paginated_data() -> list[ImageEntry]:
@@ -29,24 +28,37 @@ def get_paginated_data() -> list[ImageEntry]:
     end_idx = start_idx + st.session_state.images_per_page
     return st.session_state.image_data[start_idx:end_idx]
 
+def _make_rel_path(dataset_dir_str: str, dataset_filename: str) -> str:
+    """
+    Build a portable relative path: base_dir + dataset_filename
+    Example: dataset_dir="./dataset", dataset_filename="sub/pic.jpg" -> "./dataset/sub/pic.jpg"
+    """
+    base = dataset_dir_str.rstrip("/").rstrip("\\")
+    rel = dataset_filename.lstrip("/").lstrip("\\")
+    rel_path = f"{base}/{rel}" if base else rel
+    # Normalize to start with "./" if dataset_dir was relative and not already
+    if not Path(dataset_dir_str).is_absolute() and not rel_path.startswith("./"):
+        rel_path = f"./{rel_path.lstrip('./')}"
+    return rel_path
+
 def rescan_dataset_directory() -> int:
-    if "dataset_dir" not in st.session_state or not Path(st.session_state.dataset_dir).exists():
+    """
+    Rescan dataset_dir (non-recursive by default) and add new images.
+    If you need recursion, switch to rglob (see note below).
+    """
+    ds_str = st.session_state.get("dataset_dir", "./dataset")
+    ds_path = Path(ds_str)
+    if not ds_path.exists():
         st.error("Dataset directory not configured or doesn't exist")
         return 0
 
-    dataset_dir = Path(st.session_state.dataset_dir)
-    existing_names = {e["dataset_filename"] for e in st.session_state.image_data if e.get("dataset_filename")}
-    existing_paths = {e["full_path"] for e in st.session_state.image_data if e.get("full_path")}
+    existing_names = {e.get("dataset_filename") for e in st.session_state.image_data if e.get("dataset_filename")}
+    existing_paths = {e.get("full_path") for e in st.session_state.image_data if e.get("full_path")}
 
-    entries = []
+    # Collect image files (non-recursive). For subfolders support, replace with rglob.
     try:
-        with os.scandir(dataset_dir) as it:
-            for entry in it:
-                if not entry.is_file():
-                    continue
-                if not is_image_file(entry.name):
-                    continue
-                entries.append(entry)
+        with os.scandir(ds_path) as it:
+            entries = [entry for entry in it if entry.is_file() and is_image_file(entry.name)]
     except Exception as e:
         st.error(f"Error scanning dataset directory: {e}")
         return 0
@@ -56,27 +68,32 @@ def rescan_dataset_directory() -> int:
     total = len(entries) or 1
 
     for idx, ent in enumerate(entries):
-        name = ent.name
-        full_path = str(Path(ent.path).resolve())
-        if name in existing_names or full_path in existing_paths:
+        name = ent.name  # dataset_filename for top-level files
+        full_path = Path(ent.path).resolve()
+        if name in existing_names or str(full_path) in existing_paths:
             progress.progress((idx + 1) / total)
             continue
 
-        # Extract prompt (cached)
-        prompt = cached_extract_prompts(full_path) or ""
-        thumb_b64 = cached_thumbnail(full_path)
+        # Extract prompt and thumbnail (cached)
+        prompt = cached_extract_prompts(str(full_path)) or ""
+        thumb_b64 = cached_thumbnail(str(full_path))
+
+        # Portable rel_path = dataset_dir + dataset_filename
+        rel_path = _make_rel_path(ds_str, name)
 
         img_entry = ImageEntry(
-            id=file_hash(Path(full_path)),
+            id=file_hash(full_path),
             original_name=name,
             dataset_filename=name,
-            full_path=full_path,
+            full_path=str(full_path),  # runtime only
+            rel_path=rel_path,
             image_data=thumb_b64,
             prompt=prompt,
             modified=False,
             source="rescanned_dataset",
             debug_info=None,
         )
+
         st.session_state.image_data.append(img_entry.__dict__)
         new_images += 1
         progress.progress((idx + 1) / total)
@@ -87,7 +104,8 @@ def process_uploaded_files(uploaded_files):
     if not uploaded_files:
         return
 
-    dataset_dir = Path(st.session_state.dataset_dir)
+    ds_str = st.session_state.get("dataset_dir", "./dataset")
+    dataset_dir = Path(ds_str)
     try:
         dataset_dir.mkdir(parents=True, exist_ok=True)
     except Exception as e:
@@ -114,17 +132,22 @@ def process_uploaded_files(uploaded_files):
             prompt = cached_extract_prompts(str(dataset_path)) or ""
             thumb_b64 = cached_thumbnail(str(dataset_path))
 
+            fp = dataset_path.resolve()
+            rel_path = _make_rel_path(ds_str, unique_filename)
+
             entry = ImageEntry(
-                id=file_hash(dataset_path),
+                id=file_hash(fp),
                 original_name=up.name,
                 dataset_filename=unique_filename,
-                full_path=str(dataset_path.resolve()),
+                full_path=str(fp),
+                rel_path=rel_path,
                 image_data=thumb_b64,
                 prompt=prompt,
                 modified=False,
                 source="uploaded_to_dataset",
                 debug_info=None,
             )
+
             st.session_state.image_data.append(entry.__dict__)
             st.session_state.processed_files.append(file_id)
             new_images += 1
@@ -160,7 +183,9 @@ def main():
 
         st.subheader("📁 Dataset Configuration")
         dataset_dir_input = st.text_input(
-            "Dataset Directory:", value=st.session_state.dataset_dir, help="Directory where uploaded images will be saved"
+            "Dataset Directory:",
+            value=st.session_state.dataset_dir,
+            help="Directory where uploaded images are saved. Prefer a relative path like ./dataset"
         )
         if dataset_dir_input != st.session_state.dataset_dir:
             st.session_state.dataset_dir = dataset_dir_input
@@ -221,13 +246,17 @@ def main():
         if uploaded_jsonl and st.button("Load JSONL Data"):
             jsonl_content = uploaded_jsonl.read().decode("utf-8")
             loaded_data, base_dir = load_jsonl_data(jsonl_content)
+
+            # Note: rel_path in JSONL is authoritative and includes dataset_dir; we can ignore base_dir if desired.
+            # If images fail to load, Path Fixer can still help.
+
             if loaded_data:
                 existing_ids = {d["id"] for d in st.session_state.image_data}
                 new_count, loaded_images_count, failed = 0, 0, []
                 for item in loaded_data:
                     if item.id not in existing_ids:
-                        # Try to load image immediately for preview
                         b64, dbg = ("", None)
+                        # Full path is reconstructed from rel_path inside load_jsonl_data
                         if item.full_path:
                             b64, dbg = load_image_from_path(Path(item.full_path))
                         item.image_data = b64
@@ -262,8 +291,8 @@ def main():
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         jsonl_filename = f"image_prompts_{timestamp}.jsonl"
         if st.session_state.image_data:
-            # Convert dicts back to ImageEntry to ensure schema
             entries = [ImageEntry(**d) for d in st.session_state.image_data]
+            # Save portable JSONL. Manifest base_dir is exactly what the user typed (prefer relative).
             jsonl_content = save_to_jsonl_content(entries, Path(st.session_state.dataset_dir))
             st.download_button(
                 label="💾 Download JSONL",
@@ -307,7 +336,12 @@ def main():
 
     # Main content area
     st.header("📤 Upload Images")
-    uploaded_files = st.file_uploader("Choose PNG/JPG images", type=["png", "jpg", "jpeg"], accept_multiple_files=True, key="image_uploader")
+    uploaded_files = st.file_uploader(
+        "Choose PNG/JPG images",
+        type=["png", "jpg", "jpeg"],
+        accept_multiple_files=True,
+        key="image_uploader"
+    )
     if uploaded_files:
         with st.spinner("Processing uploaded images..."):
             process_uploaded_files(uploaded_files)
@@ -346,15 +380,11 @@ def main():
                     st.session_state.image_data[i] = entry.__dict__
                     break
             if st.button(f"🗑️ Remove", key=f"remove_{entry.id}", type="secondary"):
-                # optional: remove physical file only if inside dataset_dir and source == uploaded_to_dataset
                 try:
                     if entry.source == "uploaded_to_dataset":
                         file_path = Path(entry.full_path)
                         ds = Path(st.session_state.dataset_dir).resolve()
                         if file_path.exists() and ds in file_path.resolve().parents:
-                            # safer delete: comment out if you want hard delete
-                            # from send2trash import send2trash
-                            # send2trash(str(file_path))
                             os.remove(str(file_path))
                             st.success(f"🗑️ Deleted {file_path.name} from dataset")
                 except Exception as e:
