@@ -5,7 +5,14 @@ import streamlit as st
 from datetime import datetime
 
 from .models import ImageEntry
-from .io_utils import load_image_from_path, check_file_access, cached_thumbnail
+from .io_utils import (
+    load_image_from_path,
+    check_file_access,
+    cached_thumbnail,
+    load_pil_image,
+    resize_image,
+    save_image_with_format,
+)
 from .persistence import save_to_jsonl_content, load_jsonl_data
 from .extractors import cached_extract_prompts
 from .ui_components import render_image_row, render_fix_paths
@@ -15,15 +22,25 @@ st.set_page_config(page_title="PNG Prompt Extractor & Editor", page_icon="🖼�
 
 def init_session_state():
     ss = st.session_state
-    ss.setdefault("image_data", [])           # List[ImageEntry] stored as dicts
+    ss.setdefault("image_data", [])            # List[ImageEntry] stored as dicts
     ss.setdefault("current_page", 0)
     ss.setdefault("images_per_page", 10)
-    ss.setdefault("processed_files", [])      # list for serialization stability
+    ss.setdefault("processed_files", [])       # list for serialization stability
     ss.setdefault("debug_mode", False)
-    ss.setdefault("dataset_dir", "./dataset") # keep relative by default
+    ss.setdefault("dataset_dir", "./dataset")  # keep relative by default
     ss.setdefault("auto_rescan_done", False)
-    ss.setdefault("selected_ids", set())      # bulk selection set
-    ss.setdefault("recursive_scan", True)     # remember recursive toggle
+    ss.setdefault("selected_ids", set())       # bulk selection set
+    ss.setdefault("recursive_scan", True)      # remember recursive toggle
+
+    # Resize policy defaults
+    ss.setdefault("resize_enabled", False)
+    ss.setdefault("resize_mode", "fit")        # fit | crop | pad_square
+    ss.setdefault("resize_w", 1024)
+    ss.setdefault("resize_h", 1024)
+    ss.setdefault("resize_overwrite", False)
+    ss.setdefault("resize_output_folder", "./resized")
+    ss.setdefault("resize_format", "PNG")      # PNG | JPEG
+    ss.setdefault("resize_quality", 90)
 
 def get_paginated_data() -> list[ImageEntry]:
     start_idx = st.session_state.current_page * st.session_state.images_per_page
@@ -31,22 +48,14 @@ def get_paginated_data() -> list[ImageEntry]:
     return st.session_state.image_data[start_idx:end_idx]
 
 def _make_rel_path(dataset_dir_str: str, dataset_filename: str) -> str:
-    """
-    Build a portable relative path: base_dir + dataset_filename
-    Example: dataset_dir="./dataset", dataset_filename="sub/pic.jpg" -> "./dataset/sub/pic.jpg"
-    """
     base = dataset_dir_str.strip().rstrip("/").rstrip("\\")
     rel = dataset_filename.lstrip("/").lstrip("\\")
     rel_path = f"{base}/{rel}" if base else rel
-    # If dataset_dir is relative and rel_path doesn't start with "./", add it
     if base and not Path(base).is_absolute() and not rel_path.startswith("./"):
         rel_path = f"./{rel_path.lstrip('./')}"
     return rel_path
 
 def _safe_iter_images(ds_path: Path, recursive: bool) -> list[Path]:
-    """
-    Return a list of Path objects for image files under ds_path.
-    """
     images = []
     if not ds_path.exists():
         return images
@@ -94,23 +103,17 @@ def rescan_dataset_directory(recursive: bool = True) -> int:
     for idx, p in enumerate(image_paths):
         try:
             full_path = p.resolve()
-
-            # dataset_filename should be relative to dataset_dir (includes subfolders)
             try:
                 dataset_filename = str(full_path.relative_to(ds_path.resolve()))
             except Exception:
-                # if relative computation fails, fallback to filename
                 dataset_filename = p.name
 
-            # Dedupe
             if dataset_filename in existing_dataset_fns or str(full_path) in existing_full_paths:
                 progress.progress((idx + 1) / total)
                 continue
 
-            # Extract prompt and thumbnail (cached)
             prompt = cached_extract_prompts(str(full_path)) or ""
             thumb_b64 = cached_thumbnail(str(full_path))
-
             rel_path = _make_rel_path(ds_str, dataset_filename)
 
             img_entry = ImageEntry(
@@ -187,6 +190,19 @@ def process_uploaded_files(uploaded_files):
 
             st.session_state.image_data.append(entry.__dict__)
             st.session_state.processed_files.append(file_id)
+
+            # Optional immediate resize on upload
+            if st.session_state.resize_enabled:
+                im = load_pil_image(str(fp))
+                if im:
+                    resized = resize_image(im, (int(st.session_state.resize_w), int(st.session_state.resize_h)), mode=st.session_state.resize_mode)
+                    if st.session_state.resize_overwrite:
+                        out_path = fp
+                    else:
+                        out_base = Path(st.session_state.resize_output_folder)
+                        out_path = (out_base / unique_filename).with_suffix(".jpg" if st.session_state.resize_format == "JPEG" else ".png")
+                    save_image_with_format(resized, out_path, fmt=st.session_state.resize_format, quality=int(st.session_state.resize_quality))
+
             new_images += 1
         except Exception as e:
             st.error(f"Error processing {up.name}: {e}")
@@ -208,9 +224,89 @@ def refresh_image_data() -> int:
                 refreshed += 1
     return refreshed
 
+def _dedupe_session_entries():
+    seen = set()
+    unique = []
+    for d in st.session_state.image_data:
+        eid = d.get("id")
+        if not eid or eid in seen:
+            continue
+        seen.add(eid)
+        unique.append(d)
+    st.session_state.image_data = unique
+
+def _current_resize_policy() -> dict | None:
+    if not st.session_state.get("resize_enabled"):
+        return None
+    return {
+        "enabled": True,
+        "mode": st.session_state.get("resize_mode", "fit"),
+        "width": int(st.session_state.get("resize_w", 1024)),
+        "height": int(st.session_state.get("resize_h", 1024)),
+        "overwrite": bool(st.session_state.get("resize_overwrite", False)),
+        "output_folder": st.session_state.get("resize_output_folder", "./resized"),
+        "format": st.session_state.get("resize_format", "PNG"),
+        "quality": int(st.session_state.get("resize_quality", 90)),
+    }
+
+def _apply_resize_to_selected():
+    sel_ids = set(st.session_state.selected_ids)
+    targets = [ImageEntry(**d) for d in st.session_state.image_data if d["id"] in sel_ids]
+    if not targets:
+        st.warning("No items selected")
+        return
+
+    W = int(st.session_state.resize_w)
+    H = int(st.session_state.resize_h)
+    mode = st.session_state.resize_mode
+    fmt = st.session_state.resize_format
+    qual = int(st.session_state.resize_quality)
+    overwrite = st.session_state.resize_overwrite
+    out_folder = Path(st.session_state.resize_output_folder)
+
+    resized_ok = 0
+    resized_fail = 0
+    prog = st.progress(0.0)
+    total = len(targets) or 1
+
+    for i, entry in enumerate(targets):
+        try:
+            src_path = Path(entry.full_path)
+            if not src_path.exists():
+                resized_fail += 1
+                prog.progress((i + 1) / total)
+                continue
+
+            im = load_pil_image(str(src_path))
+            if im is None:
+                resized_fail += 1
+                prog.progress((i + 1) / total)
+                continue
+
+            resized = resize_image(im, (W, H), mode=mode)
+
+            if overwrite:
+                out_path = src_path
+            else:
+                out_path = out_folder / entry.dataset_filename
+            ext = ".jpg" if fmt.upper() == "JPEG" else ".png"
+            out_path = out_path.with_suffix(ext)
+
+            ok = save_image_with_format(resized, out_path, fmt=fmt, quality=qual)
+            if ok:
+                resized_ok += 1
+            else:
+                resized_fail += 1
+        except Exception:
+            resized_fail += 1
+        finally:
+            prog.progress((i + 1) / total)
+
+    st.success(f"Resize complete: {resized_ok} ok, {resized_fail} failed")
+
 def _bulk_bar():
     st.subheader("🧰 Bulk actions")
-    cols = st.columns([1, 1, 1, 1, 2])
+    cols = st.columns([1, 1, 1, 1.4, 1.6, 2.4])  # widened to fit new button
     with cols[0]:
         if st.button("Select all on page"):
             for d in get_paginated_data():
@@ -227,8 +323,8 @@ def _bulk_bar():
     with cols[3]:
         export_sel = st.button("Export selected JSONL")
     with cols[4]:
-        prefix = st.text_input("Prefix to add", value="", key="bulk_prefix")
-        suffix = st.text_input("Suffix to add", value="", key="bulk_suffix")
+        prefix = st.text_input("Prefix", value="", key="bulk_prefix")
+        suffix = st.text_input("Suffix", value="", key="bulk_suffix")
 
     # Apply prefix/suffix
     if prefix or suffix:
@@ -249,7 +345,8 @@ def _bulk_bar():
         if not selected:
             st.warning("No items selected")
         else:
-            jsonl_content = save_to_jsonl_content(selected, Path(st.session_state.dataset_dir))
+            policy = _current_resize_policy()
+            jsonl_content = save_to_jsonl_content(selected, Path(st.session_state.dataset_dir), resize_policy=policy)
             ts = datetime.now().strftime("%Y%m%d_%H%M%S")
             st.download_button(
                 label=f"Download selected ({len(selected)})",
@@ -257,6 +354,12 @@ def _bulk_bar():
                 file_name=f"selected_{ts}.jsonl",
                 mime="application/json",
             )
+
+    # Resize selected & save
+    with cols[5]:
+        if st.session_state.resize_enabled:
+            if st.button("Resize selected & save"):
+                _apply_resize_to_selected()
 
 def main():
     init_session_state()
@@ -335,12 +438,52 @@ def main():
             if st.button("Test Path Access"):
                 st.json(check_file_access(Path(test_path)))
 
+        # --- Auto-resize configuration (saved in manifest) ---
+        st.subheader("🖼️ Auto-resize settings")
+        st.session_state.resize_enabled = st.checkbox("Enable auto-resize (for bulk/save)", value=st.session_state.resize_enabled)
+
+        colr1, colr2 = st.columns(2)
+        with colr1:
+            st.session_state.resize_w = st.number_input("Width", min_value=16, max_value=8192, value=int(st.session_state.resize_w))
+        with colr2:
+            st.session_state.resize_h = st.number_input("Height", min_value=16, max_value=8192, value=int(st.session_state.resize_h))
+
+        st.session_state.resize_mode = st.selectbox(
+            "Mode",
+            options=["fit", "crop", "pad_square"],
+            index=["fit", "crop", "pad_square"].index(st.session_state.resize_mode),
+            help="fit: keep aspect inside WxH; crop: center-crop to WxH; pad_square: square canvas padding"
+        )
+
+        st.session_state.resize_overwrite = st.checkbox("Overwrite original files", value=st.session_state.resize_overwrite)
+        st.session_state.resize_output_folder = st.text_input("Output folder (if not overwrite)", value=st.session_state.resize_output_folder)
+        st.session_state.resize_format = st.selectbox("Output format", options=["PNG", "JPEG"], index=0 if st.session_state.resize_format == "PNG" else 1)
+        st.session_state.resize_quality = st.slider("JPEG quality", min_value=50, max_value=100, value=int(st.session_state.resize_quality))
+
         # Load JSONL
         st.subheader("Load Existing Data")
         uploaded_jsonl = st.file_uploader("Upload JSONL file", type=["jsonl"], key="jsonl_upload")
         if uploaded_jsonl and st.button("Load JSONL Data"):
             jsonl_content = uploaded_jsonl.read().decode("utf-8")
-            loaded_data, base_dir = load_jsonl_data(jsonl_content)
+            # Updated loader returns entries, base_dir, resize_policy
+            loaded = load_jsonl_data(jsonl_content)
+            # Backward compatibility: handle both 2-tuple and 3-tuple returns
+            if isinstance(loaded, tuple) and len(loaded) == 3:
+                loaded_data, base_dir, resize_policy = loaded
+            else:
+                loaded_data, base_dir = loaded  # type: ignore
+                resize_policy = None
+
+            # Apply resize policy from manifest if present
+            if resize_policy:
+                st.session_state.resize_enabled = bool(resize_policy.get("enabled", True))
+                st.session_state.resize_mode = resize_policy.get("mode", "fit")
+                st.session_state.resize_w = int(resize_policy.get("width", 1024))
+                st.session_state.resize_h = int(resize_policy.get("height", 1024))
+                st.session_state.resize_overwrite = bool(resize_policy.get("overwrite", False))
+                st.session_state.resize_output_folder = resize_policy.get("output_folder", "./resized")
+                st.session_state.resize_format = resize_policy.get("format", "PNG")
+                st.session_state.resize_quality = int(resize_policy.get("quality", 90))
 
             if loaded_data:
                 existing_ids = {d["id"] for d in st.session_state.image_data}
@@ -377,13 +520,14 @@ def main():
                 else:
                     st.info("No new images loaded")
 
-        # Save current data
+        # Save current data (with resize policy in manifest)
         st.subheader("Save Data")
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         jsonl_filename = f"image_prompts_{timestamp}.jsonl"
         if st.session_state.image_data:
             entries = [ImageEntry(**d) for d in st.session_state.image_data]
-            jsonl_content = save_to_jsonl_content(entries, Path(st.session_state.dataset_dir))
+            policy = _current_resize_policy()
+            jsonl_content = save_to_jsonl_content(entries, Path(st.session_state.dataset_dir), resize_policy=policy)
             st.download_button(
                 label="💾 Download JSONL",
                 data=jsonl_content,
@@ -447,21 +591,10 @@ def main():
         if failed_count > 0:
             render_fix_paths([ImageEntry(**d) for d in st.session_state.image_data])
 
-    # Table of images with selection
+    # Table of images with selection and unique keys
     if st.session_state.image_data:
         st.header("🖼️ Images & Prompts Table")
 
-        # Optional: prevent accidental duplicates causing key clashes
-        def _dedupe_session_entries():
-            seen = set()
-            unique = []
-            for d in st.session_state.image_data:
-                eid = d.get("id")
-                if not eid or eid in seen:
-                    continue
-                seen.add(eid)
-                unique.append(d)
-            st.session_state.image_data = unique
         _dedupe_session_entries()
 
         total_pages = (len(st.session_state.image_data) - 1) // st.session_state.images_per_page + 1
@@ -484,7 +617,7 @@ def main():
         for row_index, d in enumerate(current):
             entry = ImageEntry(**d)
 
-            # Selection checkbox with unique key per page + row + id
+            # selection checkbox with unique key per page + row + id
             sel_col, content_col = st.columns([0.3, 5.7])
             with sel_col:
                 checked = entry.id in st.session_state.selected_ids
@@ -497,13 +630,13 @@ def main():
 
             with content_col:
                 render_image_row(entry, st.session_state.debug_mode, Path(st.session_state.dataset_dir))
-                # Persist edits back
+                # persist edits
                 for i, sd in enumerate(st.session_state.image_data):
                     if sd["id"] == entry.id:
                         st.session_state.image_data[i] = entry.__dict__
                         break
 
-                # Row-level remove button — also make key unique per page + row + id
+                # row-level remove with unique key per page + row + id
                 remove_key = f"remove_{page_prefix}_{row_index}_{entry.id}"
                 if st.button("🗑️ Remove", key=remove_key, type="secondary"):
                     try:
@@ -533,7 +666,6 @@ def main():
                     st.markdown("📄 From JSONL")
 
             st.markdown("---")
-
     else:
         st.info("👆 Upload images or load a JSONL to get started")
 
