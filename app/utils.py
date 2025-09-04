@@ -24,3 +24,9 @@ def safe_json_load(s: str) -> Optional[dict]:
 
 def is_image_file(name: str) -> bool:
     return name.lower().endswith((".png", ".jpg", ".jpeg"))
+
+def relative_to_base(path: Path, base: Path) -> str:
+    try:
+        return str(path.resolve().relative_to(base.resolve()))
+    except Exception:
+        return path.name
