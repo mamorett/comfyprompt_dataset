@@ -1,0 +1,19 @@
+{
+    "providers": {
+        "openai": {
+            "api_base": "https://api.openai.com/v1/",
+            "api_key_env": "OPENAI_API_KEY",
+            "models": [
+                "gpt-4-vision-preview",
+                "gpt-4-1106-vision-preview"
+            ]
+        },
+        "groq": {
+            "api_base": "https://api.groq.com/openai/v1/",
+            "api_key_env": "GROQ_API_KEY",
+            "models": [
+                "llama2-70b-4096"
+            ]
+        }
+    }
+}
