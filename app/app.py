@@ -3,6 +3,7 @@ from pathlib import Path
 import time
 import streamlit as st
 from datetime import datetime
+import json
 
 from .models import ImageEntry
 from .io_utils import (
@@ -17,30 +18,38 @@ from .persistence import save_to_jsonl_content, load_jsonl_data
 from .extractors import cached_extract_prompts
 from .ui_components import render_image_row, render_fix_paths
 from .utils import is_image_file, file_hash
+from .vision import get_vision_provider_config, get_vision_models, run_vision_inference
+from .vision_model import init_client
 
 st.set_page_config(page_title="PNG Prompt Extractor & Editor", page_icon="🖼️", layout="wide")
 
 def init_session_state():
     ss = st.session_state
-    ss.setdefault("image_data", [])            # List[ImageEntry] stored as dicts
+    ss.setdefault("image_data", [])
     ss.setdefault("current_page", 0)
     ss.setdefault("images_per_page", 10)
-    ss.setdefault("processed_files", [])       # list for serialization stability
+    ss.setdefault("processed_files", [])
     ss.setdefault("debug_mode", False)
-    ss.setdefault("dataset_dir", "./dataset")  # keep relative by default
+    ss.setdefault("dataset_dir", "./dataset")
     ss.setdefault("auto_rescan_done", False)
-    ss.setdefault("selected_ids", set())       # bulk selection set
-    ss.setdefault("recursive_scan", True)      # remember recursive toggle
+    ss.setdefault("selected_ids", set())
+    ss.setdefault("recursive_scan", True)
 
     # Resize policy defaults
     ss.setdefault("resize_enabled", False)
-    ss.setdefault("resize_mode", "fit")        # fit | crop | pad_square
+    ss.setdefault("resize_mode", "fit")
     ss.setdefault("resize_w", 1024)
     ss.setdefault("resize_h", 1024)
     ss.setdefault("resize_overwrite", False)
     ss.setdefault("resize_output_folder", "./resized")
-    ss.setdefault("resize_format", "PNG")      # PNG | JPEG
+    ss.setdefault("resize_format", "PNG")
     ss.setdefault("resize_quality", 90)
+
+    # Vision settings
+    ss.setdefault("extraction_method", "PNG Metadata")
+    ss.setdefault("vision_provider", None)
+    ss.setdefault("vision_model", None)
+    ss.setdefault("vision_prompt", "Describe this image in detail.")
 
 def get_paginated_data() -> list[ImageEntry]:
     start_idx = st.session_state.current_page * st.session_state.images_per_page
@@ -100,6 +109,15 @@ def rescan_dataset_directory(recursive: bool = True) -> int:
     progress = st.progress(0.0)
     new_images = 0
 
+    vision_client = None
+    if st.session_state.extraction_method == "Vision Model":
+        try:
+            api_base, api_key = get_vision_provider_config(st.session_state.vision_provider)
+            vision_client = init_client(api_key, api_base)
+        except Exception as e:
+            st.error(f"Failed to initialize vision client: {e}")
+            return 0
+
     for idx, p in enumerate(image_paths):
         try:
             full_path = p.resolve()
@@ -112,7 +130,17 @@ def rescan_dataset_directory(recursive: bool = True) -> int:
                 progress.progress((idx + 1) / total)
                 continue
 
-            prompt = cached_extract_prompts(str(full_path)) or ""
+            prompt = ""
+            if st.session_state.extraction_method == "Vision Model" and vision_client:
+                prompt = run_vision_inference(
+                    client=vision_client,
+                    model=st.session_state.vision_model,
+                    prompt=st.session_state.vision_prompt,
+                    image_path=str(full_path),
+                )
+            else:
+                prompt = cached_extract_prompts(str(full_path)) or ""
+
             thumb_b64 = cached_thumbnail(str(full_path))
             rel_path = _make_rel_path(ds_str, dataset_filename)
 
@@ -152,6 +180,15 @@ def process_uploaded_files(uploaded_files):
         st.error(f"Cannot create dataset directory: {e}")
         return
 
+    vision_client = None
+    if st.session_state.extraction_method == "Vision Model":
+        try:
+            api_base, api_key = get_vision_provider_config(st.session_state.vision_provider)
+            vision_client = init_client(api_key, api_base)
+        except Exception as e:
+            st.error(f"Failed to initialize vision client: {e}")
+            return
+
     new_images = 0
     for up in uploaded_files:
         file_id = f"{up.name}_{up.size}"
@@ -169,7 +206,17 @@ def process_uploaded_files(uploaded_files):
             with dataset_path.open("wb") as f:
                 f.write(up.getbuffer())
 
-            prompt = cached_extract_prompts(str(dataset_path)) or ""
+            prompt = ""
+            if st.session_state.extraction_method == "Vision Model" and vision_client:
+                prompt = run_vision_inference(
+                    client=vision_client,
+                    model=st.session_state.vision_model,
+                    prompt=st.session_state.vision_prompt,
+                    image_path=str(dataset_path),
+                )
+            else:
+                prompt = cached_extract_prompts(str(dataset_path)) or ""
+            
             thumb_b64 = cached_thumbnail(str(dataset_path))
 
             fp = dataset_path.resolve()
@@ -191,7 +238,6 @@ def process_uploaded_files(uploaded_files):
             st.session_state.image_data.append(entry.__dict__)
             st.session_state.processed_files.append(file_id)
 
-            # Optional immediate resize on upload
             if st.session_state.resize_enabled:
                 im = load_pil_image(str(fp))
                 if im:
@@ -210,6 +256,7 @@ def process_uploaded_files(uploaded_files):
     if new_images:
         st.success(f"Successfully saved {new_images} images to dataset!")
         st.rerun()
+
 
 def refresh_image_data() -> int:
     refreshed = 0
@@ -370,6 +417,32 @@ def main():
         st.header("📁 File Operations")
 
         st.session_state.debug_mode = st.checkbox("🐛 Debug Mode", value=st.session_state.debug_mode)
+
+        # Extraction Method
+        st.subheader("⛏️ Extraction Method")
+        st.session_state.extraction_method = st.selectbox(
+            "Choose extraction method",
+            ["PNG Metadata", "Vision Model"],
+            index=0 if st.session_state.extraction_method == "PNG Metadata" else 1
+        )
+
+        if st.session_state.extraction_method == "Vision Model":
+            st.subheader("🤖 Vision Model Settings")
+            try:
+                with open("config.json") as f:
+                    config = json.load(f)["providers"]
+                provider_names = list(config.keys())
+                st.session_state.vision_provider = st.selectbox("Choose Provider", provider_names)
+
+                if st.session_state.vision_provider:
+                    api_base, api_key = get_vision_provider_config(st.session_state.vision_provider)
+                    vision_models = get_vision_models(api_base, api_key)
+                    st.session_state.vision_model = st.selectbox("Select Model", vision_models)
+                
+                st.session_state.vision_prompt = st.text_area("Vision Prompt", st.session_state.vision_prompt)
+
+            except Exception as e:
+                st.error(f"Error loading vision config: {e}")
 
         st.subheader("📁 Dataset Configuration")
         dataset_dir_input = st.text_input(
