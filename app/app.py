@@ -292,7 +292,7 @@ def _current_resize_policy() -> dict | None:
         "height": int(st.session_state.get("resize_h", 1024)),
         "overwrite": bool(st.session_state.get("resize_overwrite", False)),
         "output_folder": st.session_state.get("resize_output_folder", "./resized"),
-        "format": st.session_state.get("resize_format", "PNG"),
+        "format": st.session_state.get("resize_format", "PNG") ,
         "quality": int(st.session_state.get("resize_quality", 90)),
     }
 
